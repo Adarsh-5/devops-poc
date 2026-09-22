@@ -1,0 +1,211 @@
+# This is a basic workflow to help you get started with Actions
+
+name: GitHub API Health Check
+
+# Controls when the workflow will run
+on:
+  # Automatically runs at minute 0 of every hour.
+  schedule:
+    - cron: "0 * * * *"
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ENDPOINT_URL: "https://api.github.com"
+  REPORT_FILE: "health-check-report.md"
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "health-check"
+  health-check:
+    name: Check GitHub API Health
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      - name: Log workflow start
+        run: |
+          echo "=========================================="
+          echo "Starting endpoint health check"
+          echo "Endpoint: ${ENDPOINT_URL}"
+          echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "=========================================="
+
+      - name: Call endpoint and collect metrics
+        id: health_check
+        shell: bash
+        run: |
+          set +e
+
+          echo "Calling endpoint: ${ENDPOINT_URL}"
+
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          CURL_OUTPUT=$(curl \
+            --silent \
+            --show-error \
+            --location \
+            --output response.json \
+            --write-out "%{http_code}|%{time_total}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 2 \
+            --retry-delay 2 \
+            "${ENDPOINT_URL}")
+
+          CURL_EXIT_CODE=$?
+
+          if [ "${CURL_EXIT_CODE}" -ne 0 ]; then
+            echo "::error::curl failed with exit code ${CURL_EXIT_CODE}"
+            HTTP_STATUS="000"
+            RESPONSE_TIME="N/A"
+            HEALTH_STATUS="Unhealthy"
+            ERROR_MESSAGE="Endpoint request failed. curl exit code: ${CURL_EXIT_CODE}"
+          else
+            HTTP_STATUS=$(echo "${CURL_OUTPUT}" | cut -d'|' -f1)
+            RESPONSE_TIME_SECONDS=$(echo "${CURL_OUTPUT}" | cut -d'|' -f2)
+            RESPONSE_TIME=$(awk "BEGIN {printf \"%.0f\", ${RESPONSE_TIME_SECONDS} * 1000}")
+            ERROR_MESSAGE="None"
+
+            if [ "${HTTP_STATUS}" = "200" ]; then
+              HEALTH_STATUS="Healthy"
+            else
+              HEALTH_STATUS="Unhealthy"
+            fi
+          fi
+
+          echo "Timestamp: ${TIMESTAMP}"
+          echo "HTTP status: ${HTTP_STATUS}"
+          echo "Response time: ${RESPONSE_TIME} ms"
+          echo "Health status: ${HEALTH_STATUS}"
+
+          {
+            echo "timestamp=${TIMESTAMP}"
+            echo "http_status=${HTTP_STATUS}"
+            echo "response_time=${RESPONSE_TIME}"
+            echo "health_status=${HEALTH_STATUS}"
+            echo "curl_exit_code=${CURL_EXIT_CODE}"
+            echo "error_message=${ERROR_MESSAGE}"
+          } >> "${GITHUB_OUTPUT}"
+
+          exit 0
+
+      - name: Generate health check report
+        shell: bash
+        run: |
+          cat > "${REPORT_FILE}" <<EOF
+          # Endpoint Health Check Report
+
+          | Property | Value |
+          |---|---|
+          | Endpoint | ${ENDPOINT_URL} |
+          | Health Status | ${{ steps.health_check.outputs.health_status }} |
+          | HTTP Status Code | ${{ steps.health_check.outputs.http_status }} |
+          | Response Time | ${{ steps.health_check.outputs.response_time }} ms |
+          | Timestamp | ${{ steps.health_check.outputs.timestamp }} |
+          | curl Exit Code | ${{ steps.health_check.outputs.curl_exit_code }} |
+          | Error | ${{ steps.health_check.outputs.error_message }} |
+          | Repository | ${{ github.repository }} |
+          | Workflow | ${{ github.workflow }} |
+          | Run Number | ${{ github.run_number }} |
+          | Trigger | ${{ github.event_name }} |
+
+          ## Health Rule
+
+          The endpoint is considered **Healthy** only when the returned HTTP
+          status code is **200**. All other responses, request failures and
+          timeouts are considered **Unhealthy**.
+          EOF
+
+          echo "Generated report:"
+          cat "${REPORT_FILE}"
+
+      - name: Add summary to GitHub Actions
+        if: always()
+        shell: bash
+        run: |
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload health check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-check-report-${{ github.run_number }}
+          path: health-check-report.md
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Send health check summary to Microsoft Teams
+        if: always()
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          HEALTH_STATUS: ${{ steps.health_check.outputs.health_status }}
+          HTTP_STATUS: ${{ steps.health_check.outputs.http_status }}
+          RESPONSE_TIME: ${{ steps.health_check.outputs.response_time }}
+          TIMESTAMP: ${{ steps.health_check.outputs.timestamp }}
+        shell: bash
+        run: |
+          if [ -z "${TEAMS_WEBHOOK_URL}" ]; then
+            echo "::error::TEAMS_WEBHOOK_URL secret is not configured."
+            exit 1
+          fi
+
+          MESSAGE=$(cat <<EOF
+          GitHub API Health Check
+
+          Status: ${HEALTH_STATUS}
+          Endpoint: ${ENDPOINT_URL}
+          HTTP Status: ${HTTP_STATUS}
+          Response Time: ${RESPONSE_TIME} ms
+          Timestamp: ${TIMESTAMP}
+          Repository: ${{ github.repository }}
+          Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+
+          jq -n \
+            --arg text "${MESSAGE}" \
+            '{text: $text}' > teams-payload.json
+
+          echo "Sending health check summary to Microsoft Teams."
+
+          TEAMS_HTTP_STATUS=$(curl \
+            --silent \
+            --show-error \
+            --output teams-response.txt \
+            --write-out "%{http_code}" \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data @teams-payload.json \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 2 \
+            --retry-delay 2 \
+            "${TEAMS_WEBHOOK_URL}")
+
+          echo "Teams webhook HTTP status: ${TEAMS_HTTP_STATUS}"
+
+          if [[ ! "${TEAMS_HTTP_STATUS}" =~ ^2[0-9][0-9]$ ]]; then
+            echo "::error::Teams notification failed with HTTP status ${TEAMS_HTTP_STATUS}"
+            echo "Teams response:"
+            cat teams-response.txt
+            exit 1
+          fi
+
+          echo "Teams notification sent successfully."
+
+      - name: Set final workflow result
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.health_check.outputs.health_status }}" != "Healthy" ]; then
+            echo "::error::Endpoint health check is Unhealthy."
+            exit 1
+          fi
+
+          echo "Endpoint health check completed successfully."
